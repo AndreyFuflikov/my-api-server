@@ -1,52 +1,57 @@
-from flask import Flask, request, jsonify
-import json, os
+from flask import Flask, request, send_file, abort
+import os
+import secrets
+import tempfile
 
 app = Flask(__name__)
-DATA_FILE = 'data.json'
 
-# Инициализация данных
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    return []
+# Временное хранилище: {file_id: file_path}
+files_store = {}
 
-def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f)
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return "Нет файла", 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return "Файл не выбран", 400
+    
+    # Генерируем уникальный ID
+    file_id = secrets.token_urlsafe(8)
+    
+    # Сохраняем файл временно
+    temp_file = os.path.join(tempfile.gettempdir(), file_id)
+    file.save(temp_file)
+    
+    # Сохраняем путь и имя
+    files_store[file_id] = {
+        'path': temp_file,
+        'filename': file.filename
+    }
+    
+    return file_id
 
-data_store = load_data()
-
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({"message": "API работает! Используйте /items"})
-
-@app.route('/items', methods=['GET'])
-def get_items():
-    return jsonify(data_store)
-
-@app.route('/items', methods=['POST'])
-def add_item():
-    item = request.json
-    data_store.append(item)
-    save_data(data_store)
-    return jsonify({"id": len(data_store)-1, "item": item}), 201
-
-@app.route('/items/<int:item_id>', methods=['GET', 'PUT', 'DELETE'])
-def item_ops(item_id):
-    if 0 <= item_id < len(data_store):
-        if request.method == 'GET':
-            return jsonify(data_store[item_id])
-        elif request.method == 'PUT':
-            data_store[item_id] = request.json
-            save_data(data_store)
-            return jsonify(data_store[item_id])
-        elif request.method == 'DELETE':
-            deleted = data_store.pop(item_id)
-            save_data(data_store)
-            return jsonify({"deleted": deleted})
-    return jsonify({"error": "Item not found"}), 404
+@app.route('/download/<file_id>')
+def download_file(file_id):
+    if file_id not in files_store:
+        abort(404)
+    
+    file_info = files_store[file_id]
+    try:
+        return send_file(
+            file_info['path'],
+            as_attachment=True,
+            download_name=file_info['filename']
+        )
+    finally:
+        # Удаляем файл сразу после скачивания (даже при ошибке)
+        try:
+            os.unlink(file_info['path'])
+            del files_store[file_id]
+        except:
+            pass
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
