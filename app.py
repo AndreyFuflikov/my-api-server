@@ -1,13 +1,40 @@
-from flask import Flask, request, send_file, abort
+from flask import Flask, request, jsonify, send_file, abort
 import os
 import secrets
 import tempfile
+import json
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-files_store = {}
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
+# Хранилище файлов (имитация БД)
+FILES_DIR = os.path.join(tempfile.gettempdir(), 'installer_files')
+if not os.path.exists(FILES_DIR):
+    os.makedirs(FILES_DIR)
+
+files_db = {}  # {id: {'name': str, 'path': str, 'size': int, 'version': str}}
+
+@app.route('/status')
+def status():
+    return jsonify({"status": "ok", "files_count": len(files_db)})
+
+@app.route('/files')
+def get_files():
+    """Список всех файлов"""
+    files_list = []
+    for file_id, info in files_db.items():
+        stat = os.stat(info['path'])
+        files_list.append({
+            'id': file_id,
+            'name': info['name'],
+            'size': stat.st_size,
+            'version': info.get('version', '1.0')
+        })
+    return jsonify(files_list)
+
+@app.route('/admin/upload', methods=['POST'])
+def admin_upload():
+    """Загрузка файла (админ)"""
     if 'file' not in request.files:
         return "Нет файла", 400
     
@@ -15,44 +42,64 @@ def upload_file():
     if file.filename == '':
         return "Файл не выбран", 400
     
-    file_id = secrets.token_urlsafe(10)  # 10 символов для надёжности
-    temp_file = os.path.join(tempfile.gettempdir(), file_id)
-    file.save(temp_file)
+    file_id = secrets.token_urlsafe(12)
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(FILES_DIR, file_id)
     
-    files_store[file_id] = {
-        'path': temp_file,
-        'filename': file.filename
+    file.save(file_path)
+    
+    files_db[file_id] = {
+        'name': filename,
+        'path': file_path,
+        'version': request.form.get('version', '1.0')
     }
-    print(f"📤 Загружен: {file.filename} → ID: {file_id}")
     
-    return file_id
+    return jsonify({'id': file_id, 'message': 'Загружен успешно'}), 200
 
 @app.route('/download/<file_id>')
 def download_file(file_id):
-    if file_id not in files_store:
-        print(f"❌ Файл {file_id} не найден")
+    """Скачивание файла"""
+    if file_id not in files_db:
         abort(404)
     
-    file_info = files_store[file_id]
-    
-    # ✅ ПРОСТОЙ send_file — БЕЗ удаления!
-    try:
-        response = send_file(
-            file_info['path'],
-            as_attachment=True,
-            download_name=file_info['filename'],
-            mimetype='application/octet-stream'
-        )
-        print(f"✅ Файл {file_id} отправлен")
-        return response
-    except Exception as e:
-        print(f"❌ Ошибка отправки {file_id}: {e}")
-        abort(500)
+    file_info = files_db[file_id]
+    return send_file(file_info['path'], 
+                    as_attachment=True, 
+                    download_name=file_info['name'])
 
-@app.route('/', methods=['GET'])
-def status():
-    return "Сервер работает! Загрузка: POST /upload, Скачивание: GET /download/ID"
+@app.route('/admin/file/<file_id>', methods=['DELETE'])
+def admin_delete(file_id):
+    """Удаление файла (админ)"""
+    if file_id in files_db:
+        try:
+            os.unlink(files_db[file_id]['path'])
+            del files_db[file_id]
+            return jsonify({'message': 'Удалено'}), 200
+        except:
+            pass
+    abort(404)
+
+@app.route('/admin/file/<file_id>/rename', methods=['PUT'])
+def admin_rename(file_id):
+    """Переименование (админ)"""
+    data = request.get_json()
+    if file_id in files_db and data.get('name'):
+        files_db[file_id]['name'] = secure_filename(data['name'])
+        return jsonify({'message': 'Переименовано'}), 200
+    abort(400)
+
+@app.route('/')
+def index():
+    return '''
+    <h1>🚀 Сервер установщика программ</h1>
+    <p>✅ Готов к работе!</p>
+    <ul>
+        <li>GET /files - список программ</li>
+        <li>POST /admin/upload - загрузка (админ)</li>
+        <li>GET /download/:id - скачивание</li>
+    </ul>
+    '''
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
