@@ -1,158 +1,95 @@
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, jsonify, send_from_directory, abort, request
 import os
-import secrets
-import sqlite3
-import shutil
-from werkzeug.utils import secure_filename
-import tempfile
 
 app = Flask(__name__)
 
-# Постоянная папка для файлов
-UPLOAD_DIR = os.path.join(os.getcwd(), 'uploads')
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Папка с программами относительно app.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PACKAGES_DIR = os.path.join(BASE_DIR, "packages")
 
-def init_db():
-    """Инициализация БД"""
-    conn = sqlite3.connect('files.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS files 
-                 (id TEXT PRIMARY KEY, name TEXT, path TEXT, size INTEGER, version TEXT)''')
-    conn.commit()
-    conn.close()
+# Базовый URL сервера (для формирования ссылок в /files)
+# На Render нужно заменить на ваш реальный URL (например, https://my-api-server-1-siht.onrender.com)
+SERVER_BASE_URL = os.environ.get("SERVER_BASE_URL", "http://localhost:10000")
 
-init_db()
 
-@app.route('/status')
+def scan_packages():
+    """
+    Сканирует папку packages и возвращает список файлов с размерами.
+    """
+    files = []
+    if not os.path.exists(PACKAGES_DIR):
+        return files
+
+    for name in os.listdir(PACKAGES_DIR):
+        path = os.path.join(PACKAGES_DIR, name)
+        if os.path.isfile(path):
+            size = os.path.getsize(path)
+            files.append({
+                "id": name,                     # ID = имя файла
+                "name": name,                   # отображаемое имя
+                "size": size,                   # размер в байтах
+                "version": "1.0",               # можно потом расширить
+                "download_url": f"{SERVER_BASE_URL}/download/{name}"
+            })
+    return files
+
+
+@app.route("/status")
 def status():
-    conn = sqlite3.connect('files.db')
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM files')
-    count = c.fetchone()[0]
-    conn.close()
-    return jsonify({"status": "ok", "files_count": count})
+    """
+    Простой статус для клиента (экран загрузки).
+    """
+    files = scan_packages()
+    return jsonify({
+        "status": "ok",
+        "files_count": len(files)
+    })
 
-@app.route('/files')
+
+@app.route("/files")
 def get_files():
-    """Список всех файлов"""
-    conn = sqlite3.connect('files.db')
-    c = conn.cursor()
-    c.execute('SELECT id, name, size, version FROM files')
-    rows = c.fetchall()
-    conn.close()
-    
-    files_list = []
-    for row in rows:
-        file_id, name, size, version = row
-        files_list.append({
-            'id': file_id,
-            'name': name,
-            'size': size,
-            'version': version or '1.0'
-        })
-    return jsonify(files_list)
+    """
+    Возвращает список файлов в папке packages.
+    """
+    files = scan_packages()
+    return jsonify(files)
 
-@app.route('/admin/upload', methods=['POST'])
-def admin_upload():
-    """Загрузка файла (админ)"""
-    if 'file' not in request.files:
-        return "Нет файла", 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return "Файл не выбран", 400
-    
-    file_id = secrets.token_urlsafe(12)
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{filename}")
-    
-    file.save(file_path)
-    
-    # Сохранить в БД
-    conn = sqlite3.connect('files.db')
-    c = conn.cursor()
-    stat = os.stat(file_path)
-    c.execute("INSERT INTO files (id, name, path, size, version) VALUES (?, ?, ?, ?, ?)",
-              (file_id, filename, file_path, stat.st_size, request.form.get('version', '1.0')))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'id': file_id, 'message': 'Загружен успешно'}), 200
 
-@app.route('/download/<file_id>')
-def download_file(file_id):
-    """Скачивание файла"""
-    conn = sqlite3.connect('files.db')
-    c = conn.cursor()
-    c.execute("SELECT path, name FROM files WHERE id = ?", (file_id,))
-    row = c.fetchone()
-    conn.close()
-    
-    if not row:
-        abort(404)
-    
-    file_path, filename = row
-    if not os.path.exists(file_path):
-        # Удалить из БД если файл пропал
-        conn = sqlite3.connect('files.db')
-        c = conn.cursor()
-        c.execute("DELETE FROM files WHERE id = ?", (file_id,))
-        conn.commit()
-        conn.close()
-        abort(404)
-    
-    return send_file(file_path, 
-                    as_attachment=True, 
-                    download_name=filename)
-
-@app.route('/admin/file/<file_id>', methods=['DELETE'])
-def admin_delete(file_id):
-    """Удаление файла (админ)"""
-    conn = sqlite3.connect('files.db')
-    c = conn.cursor()
-    c.execute("SELECT path FROM files WHERE id = ?", (file_id,))
-    row = c.fetchone()
-    
-    if row:
-        file_path = row[0]
-        try:
-            os.unlink(file_path)
-            c.execute("DELETE FROM files WHERE id = ?", (file_id,))
-            conn.commit()
-            conn.close()
-            return jsonify({'message': 'Удалено'}), 200
-        except:
-            conn.close()
-            pass
-    abort(404)
-
-@app.route('/admin/file/<file_id>/rename', methods=['PUT'])
-def admin_rename(file_id):
-    """Переименование (админ)"""
-    data = request.get_json()
-    if not data or not data.get('name'):
+@app.route("/download/<filename>")
+def download_file(filename):
+    """
+    Скачивание файла из папки packages.
+    """
+    # Защита от попыток выйти за пределы папки
+    if "/" in filename or "\\" in filename:
         abort(400)
-    
-    new_name = secure_filename(data['name'])
-    conn = sqlite3.connect('files.db')
-    c = conn.cursor()
-    c.execute("UPDATE files SET name = ? WHERE id = ?", (new_name, file_id))
-    
-    if c.rowcount > 0:
-        conn.commit()
-        conn.close()
-        return jsonify({'message': 'Переименовано'}), 200
-    
-    conn.close()
-    abort(404)
 
-@app.route('/')
+    full_path = os.path.join(PACKAGES_DIR, filename)
+    if not os.path.isfile(full_path):
+        abort(404)
+
+    # send_from_directory корректно выставляет заголовки и скачивание
+    return send_from_directory(
+        directory=PACKAGES_DIR,
+        path=filename,
+        as_attachment=True,
+        download_name=filename
+    )
+
+
+@app.route("/")
 def index():
-    return '''
-    <h1>🚀 Сервер установщика программ (SQLite)</h1>
-    <p>✅ Файлы НЕ исчезают при перезапуске!</p>
-    '''
+    return """
+    <h1>🚀 Сервер установщика (Git-папка packages)</h1>
+    <p>Все программы лежат в папке <code>packages/</code> рядом с app.py.</p>
+    <ul>
+        <li>GET /status — статус сервера и кол-во файлов</li>
+        <li>GET /files — список программ (JSON)</li>
+        <li>GET /download/&lt;filename&gt; — скачивание файла</li>
+    </ul>
+    """
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
