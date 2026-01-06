@@ -1,34 +1,54 @@
 from flask import Flask, request, jsonify, send_file, abort
 import os
 import secrets
-import tempfile
-import json
+import sqlite3
+import shutil
 from werkzeug.utils import secure_filename
+import tempfile
 
 app = Flask(__name__)
 
-# Хранилище файлов (имитация БД)
-FILES_DIR = os.path.join(tempfile.gettempdir(), 'installer_files')
-if not os.path.exists(FILES_DIR):
-    os.makedirs(FILES_DIR)
+# Постоянная папка для файлов
+UPLOAD_DIR = os.path.join(os.getcwd(), 'uploads')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-files_db = {}  # {id: {'name': str, 'path': str, 'size': int, 'version': str}}
+def init_db():
+    """Инициализация БД"""
+    conn = sqlite3.connect('files.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS files 
+                 (id TEXT PRIMARY KEY, name TEXT, path TEXT, size INTEGER, version TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 @app.route('/status')
 def status():
-    return jsonify({"status": "ok", "files_count": len(files_db)})
+    conn = sqlite3.connect('files.db')
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM files')
+    count = c.fetchone()[0]
+    conn.close()
+    return jsonify({"status": "ok", "files_count": count})
 
 @app.route('/files')
 def get_files():
     """Список всех файлов"""
+    conn = sqlite3.connect('files.db')
+    c = conn.cursor()
+    c.execute('SELECT id, name, size, version FROM files')
+    rows = c.fetchall()
+    conn.close()
+    
     files_list = []
-    for file_id, info in files_db.items():
-        stat = os.stat(info['path'])
+    for row in rows:
+        file_id, name, size, version = row
         files_list.append({
             'id': file_id,
-            'name': info['name'],
-            'size': stat.st_size,
-            'version': info.get('version', '1.0')
+            'name': name,
+            'size': size,
+            'version': version or '1.0'
         })
     return jsonify(files_list)
 
@@ -44,38 +64,65 @@ def admin_upload():
     
     file_id = secrets.token_urlsafe(12)
     filename = secure_filename(file.filename)
-    file_path = os.path.join(FILES_DIR, file_id)
+    file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{filename}")
     
     file.save(file_path)
     
-    files_db[file_id] = {
-        'name': filename,
-        'path': file_path,
-        'version': request.form.get('version', '1.0')
-    }
+    # Сохранить в БД
+    conn = sqlite3.connect('files.db')
+    c = conn.cursor()
+    stat = os.stat(file_path)
+    c.execute("INSERT INTO files (id, name, path, size, version) VALUES (?, ?, ?, ?, ?)",
+              (file_id, filename, file_path, stat.st_size, request.form.get('version', '1.0')))
+    conn.commit()
+    conn.close()
     
     return jsonify({'id': file_id, 'message': 'Загружен успешно'}), 200
 
 @app.route('/download/<file_id>')
 def download_file(file_id):
     """Скачивание файла"""
-    if file_id not in files_db:
+    conn = sqlite3.connect('files.db')
+    c = conn.cursor()
+    c.execute("SELECT path, name FROM files WHERE id = ?", (file_id,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
         abort(404)
     
-    file_info = files_db[file_id]
-    return send_file(file_info['path'], 
+    file_path, filename = row
+    if not os.path.exists(file_path):
+        # Удалить из БД если файл пропал
+        conn = sqlite3.connect('files.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        conn.commit()
+        conn.close()
+        abort(404)
+    
+    return send_file(file_path, 
                     as_attachment=True, 
-                    download_name=file_info['name'])
+                    download_name=filename)
 
 @app.route('/admin/file/<file_id>', methods=['DELETE'])
 def admin_delete(file_id):
     """Удаление файла (админ)"""
-    if file_id in files_db:
+    conn = sqlite3.connect('files.db')
+    c = conn.cursor()
+    c.execute("SELECT path FROM files WHERE id = ?", (file_id,))
+    row = c.fetchone()
+    
+    if row:
+        file_path = row[0]
         try:
-            os.unlink(files_db[file_id]['path'])
-            del files_db[file_id]
+            os.unlink(file_path)
+            c.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            conn.commit()
+            conn.close()
             return jsonify({'message': 'Удалено'}), 200
         except:
+            conn.close()
             pass
     abort(404)
 
@@ -83,21 +130,27 @@ def admin_delete(file_id):
 def admin_rename(file_id):
     """Переименование (админ)"""
     data = request.get_json()
-    if file_id in files_db and data.get('name'):
-        files_db[file_id]['name'] = secure_filename(data['name'])
+    if not data or not data.get('name'):
+        abort(400)
+    
+    new_name = secure_filename(data['name'])
+    conn = sqlite3.connect('files.db')
+    c = conn.cursor()
+    c.execute("UPDATE files SET name = ? WHERE id = ?", (new_name, file_id))
+    
+    if c.rowcount > 0:
+        conn.commit()
+        conn.close()
         return jsonify({'message': 'Переименовано'}), 200
-    abort(400)
+    
+    conn.close()
+    abort(404)
 
 @app.route('/')
 def index():
     return '''
-    <h1>🚀 Сервер установщика программ</h1>
-    <p>✅ Готов к работе!</p>
-    <ul>
-        <li>GET /files - список программ</li>
-        <li>POST /admin/upload - загрузка (админ)</li>
-        <li>GET /download/:id - скачивание</li>
-    </ul>
+    <h1>🚀 Сервер установщика программ (SQLite)</h1>
+    <p>✅ Файлы НЕ исчезают при перезапуске!</p>
     '''
 
 if __name__ == '__main__':
